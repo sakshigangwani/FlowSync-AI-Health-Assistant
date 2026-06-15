@@ -1,302 +1,199 @@
-# 🩺 FlowSync AI Health Assistant
+# FlowSync — Multi-Agent AI Health Assistant
 
-### Multi-Agent AI Health Assistant for Women's Health Support using Retrieval-Augmented Generation (RAG)
+> A production-style, multi-agent Retrieval-Augmented Generation (RAG) system for women's health support. Built to demonstrate end-to-end ownership of an applied-LLM product: data ingestion, vector retrieval, agent orchestration, API design, and a real-time web client.
 
-FlowSync AI Health Assistant is a **multi-agent conversational AI system** designed to provide guidance on women's health topics such as hormonal health, symptoms, wellness, and general medical knowledge.
-
-The assistant combines **specialized AI agents** with **Retrieval-Augmented Generation (RAG)** to provide grounded, contextual responses using medical knowledge sources.
-
-The system integrates:
-
-- OpenAI LLM responses
-- Pinecone vector database
-- HuggingFace embeddings
-- Flask backend
-- Chat-based web interface
+FlowSync routes each user question to one of three **specialized LLM agents** (Medical, Symptom, Lifestyle) through a hybrid LLM + heuristic **router**, grounds every answer in a **Pinecone** vector store via **RAG**, and serves it over a Flask REST API and a streaming chat UI.
 
 ---
 
-# 📌 Overview
+## Why this project is interesting (engineering summary)
 
-The system intelligently routes each user query to the most suitable **specialist AI agent**.
+This isn't a single-prompt chatbot wrapper. The design problem it solves is **specialization + routing under cost and latency constraints**, which surfaces the trade-offs that matter in real LLM systems:
 
-### Agents
-
-| Agent | Responsibility |
-|------|------|
-| **MedicalAgent** | Explains medical conditions, concepts, and treatments |
-| **SymptomAgent** | Interprets symptoms and suggests possible next steps |
-| **LifestyleAgent** | Provides guidance on wellness, nutrition, sleep, stress, and habits |
-
-Each agent can retrieve contextual information from the **vector database** to generate accurate responses.
+- **Multi-agent decomposition.** Instead of one bloated system prompt, responsibilities are split across three agents with independently tuned decoding parameters (temperature/`max_tokens`) and retrieval depth (`k`). This improves answer quality per domain and keeps each prompt small and debuggable.
+- **Hybrid routing with graceful degradation.** A low-temperature LLM classifier decides which agent handles a query, with a **deterministic keyword-scoring fallback** that takes over on any LLM error or timeout — the system never hard-fails on the classification step.
+- **Retrieval/generation separation.** Embedding, indexing, and retrieval live behind a `MedicalRetriever` abstraction, so the vector backend or embedding model can change without touching agent code.
+- **Cost-aware model selection.** Routing uses a cheap 50-token call; only the chosen specialist agent does the expensive generation. Local Sentence-Transformers embeddings avoid per-call embedding API costs.
+- **Clear seams for scale.** Indexing is an offline batch job; serving is stateless; agents are independent objects. Each piece can be scaled or replaced in isolation.
 
 ---
 
-# 🚀 Key Features
-
-- Multi-agent AI architecture
-- Intelligent query routing
-- Retrieval-Augmented Generation (RAG)
-- Pinecone vector database integration
-- Document-based medical knowledge
-- Real-time conversational chat UI
-- Typing animation for AI responses
-- Thinking animation during retrieval
-- Modular and scalable Python codebase
-- REST API endpoints for chat and system checks
-
----
-
-# 🧠 System Architecture
+## System Architecture
 
 ```
-User Query
-    │
-    ▼
-Question Router
-    │
-    ▼
-Specialist Agent
-    │
-    ▼
-Retriever (Pinecone)
-    │
-    ▼
-LLM Response
-    │
-    ▼
-Chat UI / API
+                          ┌──────────────────────────────┐
+   User query ──────────▶ │       QuestionRouter         │
+                          │  LLM classifier (temp=0.1)   │
+                          │  └─ fallback: keyword scoring│
+                          └───────────────┬──────────────┘
+                                          │ route: medical | symptom | lifestyle
+            ┌─────────────────────────────┼─────────────────────────────┐
+            ▼                             ▼                              ▼
+   ┌────────────────┐          ┌────────────────────┐          ┌──────────────────┐
+   │  MedicalAgent  │          │   SymptomAgent     │          │  LifestyleAgent  │
+   │  temp 0.4, k=3 │          │  temp 0.3, k=4     │          │  temp 0.5, k=3   │
+   │                │◀─────────│  (can delegate to  │          │                  │
+   └───────┬────────┘ collab.  │   MedicalAgent)    │          └────────┬─────────┘
+           │                   └─────────┬──────────┘                   │
+           └──────────────────┬──────────┴──────────────────────────────┘
+                              ▼
+                   ┌─────────────────────┐        ┌───────────────────────────┐
+                   │  MedicalRetriever   │───────▶│   Pinecone (serverless)    │
+                   │  (RAG, cosine, 384d)│        │   index: medical-chatbot   │
+                   └──────────┬──────────┘        └───────────────────────────┘
+                              ▲
+                              │ embeddings (offline + query time)
+                   ┌──────────┴──────────────────────┐
+                   │ HuggingFace Sentence-Transformers│
+                   │   all-MiniLM-L6-v2 (384-dim)     │
+                   └──────────────────────────────────┘
 ```
 
-### Core Modules
-
-| Module | Description |
-|------|------|
-| `agents/` | Specialized AI agents |
-| `orchestrator/router.py` | Agent routing logic |
-| `retrieval/retriever.py` | Pinecone retriever setup |
-| `app.py` | Flask backend API |
-| `store_index.py` | Document embedding pipeline |
+### Request lifecycle
+1. **Classify** — `QuestionRouter` calls a low-temperature LLM to label the query `MEDICAL | SYMPTOM | LIFESTYLE`; on failure it falls back to keyword scoring.
+2. **Retrieve** — the selected agent queries `MedicalRetriever`, which embeds the query and runs cosine top-`k` similarity search against Pinecone.
+3. **Generate** — the agent composes a domain-specific prompt with the retrieved context and calls the LLM with agent-tuned decoding params.
+4. **Respond** — Flask returns plain text (`/get`, for the UI) or structured JSON with agent metadata (`/api/chat`).
 
 ---
 
-# 📂 Project Structure
+## Key Design Decisions & Trade-offs
+
+| Decision | Rationale | Trade-off considered |
+|---|---|---|
+| **Three specialized agents** vs. one generalist | Smaller, auditable prompts; per-domain tuning; better grounding | More moving parts and a routing step to maintain |
+| **Hybrid LLM + keyword router** | LLM gives semantic accuracy; keyword fallback guarantees availability and zero-cost degradation | Keyword fallback is coarser; accepted because it only triggers on LLM failure |
+| **Local Sentence-Transformers** (`all-MiniLM-L6-v2`, 384-dim) | No per-query embedding API cost; fast; strong quality-for-size | Larger models could improve recall at higher compute cost |
+| **Pinecone serverless** (cosine, `k=3–4`) | Managed, low-ops vector search that scales independently of the app | Vendor coupling, mitigated by the `MedicalRetriever` abstraction |
+| **Per-agent decoding params** | Symptom answers stay conservative (`temp=0.3`); lifestyle is more open (`temp=0.5`) | Requires deliberate tuning rather than one global default |
+| **Offline indexing job** (`store_index.py`) | Keeps the serving path fast and stateless; re-indexing is decoupled from request handling | Index can go stale; refreshed by re-running the batch job |
+| **`RecursiveCharacterTextSplitter`** (500 chars, 20 overlap) | Balances retrieval granularity against context fragmentation | Smaller chunks raise recall but increase index size |
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|---|---|
+| Language | Python 3 |
+| LLM orchestration | LangChain (`langchain`, `langchain-openai`, `langchain-pinecone`, `langchain-huggingface`) |
+| Generation model | OpenAI LLM (via `langchain-openai`) |
+| Embeddings | HuggingFace Sentence-Transformers — `all-MiniLM-L6-v2` (384-dim) |
+| Vector store | Pinecone (serverless, AWS `us-east-1`, cosine similarity) |
+| Document processing | `pypdf`, `RecursiveCharacterTextSplitter` |
+| Backend | Flask (REST + server-rendered chat) |
+| Frontend | HTML/CSS/JS chat UI with typing & retrieval animations |
+| Config | `python-dotenv` |
+
+---
+
+## Project Structure
 
 ```text
 flowsync-ai-health-assistant/
-│
-├── agents/
-│   ├── medical_agent.py
-│   ├── symptom_agent.py
-│   └── lifestyle_agent.py
-│
+├── agents/                  # Specialized LLM agents (independent, swappable)
+│   ├── medical_agent.py     #   conditions, hormones, pathophysiology
+│   ├── symptom_agent.py     #   symptom interpretation (+ delegation to MedicalAgent)
+│   └── lifestyle_agent.py   #   nutrition, exercise, sleep, stress
 ├── orchestrator/
-│   └── router.py
-│
+│   └── router.py            # Hybrid LLM + keyword query router
 ├── retrieval/
-│   └── retriever.py
-│
+│   └── retriever.py         # MedicalRetriever — RAG abstraction over Pinecone
 ├── src/
-│   ├── helper.py
-│   └── prompt.py
-│
-├── templates/
-│   └── chat.html
-│
-├── static/
-│   └── styles.css
-│
-├── Data/
-│
-├── app.py
-├── store_index.py
-├── check_setup.py
-├── quick_test.py
-├── test_agents.py
-├── examples.py
-├── requirements.txt
-└── README.md
+│   ├── helper.py            # Loaders, chunking, embeddings, upsert
+│   └── prompt.py            # Prompt templates
+├── templates/chat.html      # Chat UI
+├── static/styles.css
+├── Data/                    # Source medical documents (PDF)
+├── store_index.py           # Offline indexing / embedding pipeline
+├── app.py                   # Flask app + REST API
+├── check_setup.py           # Environment/config verification
+├── quick_test.py            # Smoke tests
+├── test_agents.py           # Agent-level tests
+├── examples.py              # Example query flows
+└── requirements.txt
 ```
 
 ---
 
-# ⚙️ Setup
+## Getting Started
 
-## 1. Clone the Repository
-
+### 1. Clone & install
 ```bash
 git clone https://github.com/sakshigangwani/flowsync-ai-health-assistant.git
 cd flowsync-ai-health-assistant
-```
 
----
-
-## 2. Create Virtual Environment
-
-```bash
 python -m venv .venv
-source .venv/bin/activate
-```
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
 
-For Windows:
-
-```bash
-.venv\Scripts\activate
-```
-
----
-
-## 3. Install Dependencies
-
-```bash
 pip install -r requirements.txt
 ```
 
----
-
-## 4. Environment Variables
-
-Create a `.env` file in the project root.
-
+### 2. Configure environment
+Create a `.env` in the project root:
 ```env
 OPENAI_API_KEY=your_openai_api_key
 PINECONE_API_KEY=your_pinecone_api_key
 ```
 
----
-
-## 5. Verify Setup
-
+### 3. Verify setup
 ```bash
 python check_setup.py
 ```
 
----
-
-# ▶️ Running the Project
-
-## Step 1 — Build Vector Index
-
-Convert documents into embeddings and store them in Pinecone.
-
+### 4. Build the vector index (offline, one-time / on data change)
 ```bash
 python store_index.py
 ```
+Loads PDFs from `Data/` → splits into 500-char chunks → embeds with `all-MiniLM-L6-v2` → creates the `medical-chatbot` index (384-dim, cosine, serverless) if missing → upserts vectors.
 
-This step:
-
-- Loads medical documents
-- Splits text into chunks
-- Generates embeddings
-- Stores vectors in Pinecone
-
----
-
-## Step 2 — Start the Application
-
+### 5. Run the app
 ```bash
 python app.py
-```
-
-Open your browser:
-
-```
-http://127.0.0.1:8080
+# http://127.0.0.1:8080
 ```
 
 ---
 
-# 💬 Chat Interface
+## API Reference
 
-The web interface includes:
+### `POST /api/chat`
+Structured chat endpoint with agent metadata.
 
-- FlowSync AI health assistant chat
-- Typing animation for responses
-- Thinking animation while retrieving knowledge
-- Clean responsive UI
-
-Example questions:
-
-- What is PCOS?
-- Why are my periods irregular?
-- What causes hormonal acne?
-- What diet helps balance hormones?
-
----
-
-# 🌐 API Endpoints
-
-## Chat
-
-**POST**
-
-```
-/api/chat
-```
-
-### Example Request
-
+**Request**
 ```json
-{
-  "message": "What is PCOS?"
-}
+{ "message": "What is PCOS?" }
 ```
-
-### Example Response
-
+**Response**
 ```json
 {
   "answer": "...",
   "agent_type": "medical",
-  "agent_name": "Medical Knowledge Agent"
+  "agent_name": "Medical Knowledge"
 }
 ```
 
----
+### `GET /api/agents`
+Returns the catalog of available agents and their declared expertise.
 
-## List Agents
-
-**GET**
-
-```
-/api/agents
-```
-
-Returns available agents and descriptions.
+### `POST /get`
+Form-encoded endpoint backing the web UI; returns plain-text answer.
 
 ---
 
-# 🧪 Testing
-
-Run various tests to verify system behavior.
-
-### Quick Test
+## Testing
 
 ```bash
-python quick_test.py
-```
-
-### Agent Tests
-
-```bash
-python test_agents.py
-```
-
-### Example Flows
-
-```bash
-python examples.py
+python quick_test.py     # fast smoke test of the end-to-end path
+python test_agents.py    # per-agent behavior
+python examples.py       # representative query flows across all agents
 ```
 
 ---
 
-# 🔮 Future Improvements
-
-- Multi-document knowledge base
-- Conversation memory for personalized guidance
-- Voice-based health assistant
-- Advanced symptom analysis
-- Integration with FlowSync mobile app
-- Personalized health insights
+## Example Queries
+- **Medical** → "What is PCOS?" · "How does insulin resistance work?"
+- **Symptom** → "I have acne and irregular periods" · "What causes fatigue?"
+- **Lifestyle** → "What diet helps balance hormones?" · "Best exercises for weight loss?"
 
 ---
